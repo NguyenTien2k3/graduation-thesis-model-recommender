@@ -24,6 +24,8 @@ CSV_HF_URL = "https://huggingface.co/datasets/Stas2k3/Cell_Phones_and_Accessorie
 CACHE_DIR = "/tmp"
 MODEL_PATH = os.path.join(CACHE_DIR, "model.pkl")
 CSV_PATH = os.path.join(CACHE_DIR, "data.csv")
+# Đường dẫn cache mới cho danh sách Item ID đã xử lý (TỐC ĐỘ CAO)
+ITEM_IDS_PATH = os.path.join(CACHE_DIR, "item_ids.pkl")
 
 # ==========================================================================
 # 2. Hàm tải file tối ưu RAM (stream) - Đã sửa lỗi giới hạn log
@@ -68,22 +70,47 @@ def download_file_stream(url, save_path, name, max_retries=5):
     return False
 
 # ==========================================================================
-# 3. Load dữ liệu
+# 3. Load dữ liệu - Đã tối ưu tốc độ load Item ID
 # ==========================================================================
 
 def load_items():
-    """Tải CSV bằng stream và đọc từ file."""
+    """
+    Tải và load danh sách item ID. Ưu tiên load từ file cache pickle đã xử lý (ITEM_IDS_PATH)
+    để tránh đọc lại CSV bằng Pandas (chậm).
+    """
+    # 1. Thử load từ cache nhanh ITEM_IDS_PATH
+    if os.path.exists(ITEM_IDS_PATH):
+        try:
+            logging.info("Đang load Item IDs từ cache nhanh...")
+            with open(ITEM_IDS_PATH, 'rb') as f:
+                unique_items = pickle.load(f)
+            logging.info(f"✅ Item IDs đã load từ cache: {len(unique_items)} items duy nhất.")
+            return unique_items
+        except Exception as e:
+            logging.warning(f"Lỗi đọc cache Item IDs: {e}. Sẽ load lại từ CSV.")
+
+    # 2. Nếu cache nhanh không tồn tại hoặc lỗi, fallback về CSV (quá trình chậm)
     if not download_file_stream(CSV_HF_URL, CSV_PATH, "CSV Data"):
         return []
+    
     try:
-        logging.info("Đọc CSV từ đĩa...")
+        logging.info("Đọc CSV TỪ ĐĨA (quá trình chậm)...")
         items_df = pd.read_csv(CSV_PATH)
         # Xử lý cột parent_asin để chỉ lấy ASIN đầu tiên nếu là danh sách
         items_df["parent_asin"] = (
             items_df["parent_asin"].astype(str).str.split(",").str[0]
         )
         unique_items = items_df["parent_asin"].dropna().unique().tolist()
-        logging.info(f"✅ CSV đã load: {len(unique_items)} items duy nhất.")
+        logging.info(f"✅ CSV đã load và xử lý: {len(unique_items)} items duy nhất.")
+
+        # 3. Lưu kết quả xử lý vào cache nhanh ITEM_IDS_PATH
+        try:
+            with open(ITEM_IDS_PATH, 'wb') as f:
+                pickle.dump(unique_items, f)
+            logging.info("✅ Đã tạo cache nhanh Item IDs.")
+        except Exception as e:
+            logging.warning(f"Lỗi khi lưu cache Item IDs: {e}")
+
         return unique_items
     except Exception as e:
         logging.error(f"Lỗi đọc CSV: {e}")
@@ -94,6 +121,7 @@ def load_model():
     if not download_file_stream(MODEL_HF_URL, MODEL_PATH, "Model"):
         return None
     try:
+        logging.info("Đang load Model từ đĩa...")
         with open(MODEL_PATH, "rb") as f:
             model = pickle.load(f)
         logging.info("✅ Model đã load thành công.")
