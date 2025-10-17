@@ -7,11 +7,6 @@ WORKDIR /app
 # Sao chép toàn bộ repo vào môi trường build
 COPY . .
 
-# Chạy lệnh git lfs để tải về các file thật
-# Nếu lệnh này thất bại, quá trình build sẽ dừng lại
-RUN git lfs install && git lfs pull
-
-
 # ===== GIAI ĐOẠN 2: FINAL IMAGE - XÂY DỰNG ỨNG DỤNG =====
 # Stage này sẽ tạo ra image cuối cùng để chạy
 # SỬA LỖI: Chuyển sang base image đầy đủ hơn để giải quyết lỗi tương thích của scipy
