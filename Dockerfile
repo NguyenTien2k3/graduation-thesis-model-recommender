@@ -2,12 +2,13 @@ FROM python:3.9-slim
 
 WORKDIR /app
 
-# Install system dependencies, INCLUDING git
-# This is the main fix for your error
+# Install system dependencies, INCLUDING git and git-lfs
+# This is the fix for the "git: 'lfs' is not a git command" error
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     g++ \
     git \
+    git-lfs \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /app/
@@ -29,3 +30,4 @@ CMD ["gunicorn", "-w", "1", "--preload", "--timeout", "300", \
     "--worker-tmp-dir", "/dev/shm", \
     "--max-requests", "100", "--max-requests-jitter", "10", \
     "--bind", "0.0.0.0:8000", "app:app"]
+
