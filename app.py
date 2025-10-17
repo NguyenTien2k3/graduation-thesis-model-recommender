@@ -5,7 +5,8 @@ import os
 import logging
 import requests
 import time
-import threading # <-- Import mới để chạy nền
+import threading
+import gc # Import Garbage Collector để quản lý RAM
 
 # ==========================================================================
 # 1. Cấu hình & Hằng số
@@ -17,20 +18,25 @@ logging.basicConfig(
 
 app = Flask(__name__)
 
-# Các URL tải model và CSV
+# CÁC URL VÀ PATH CỦA FILE DỮ LIỆU
 MODEL_HF_URL = "https://huggingface.co/Stas2k3/svd_model_nf32_lr0.001_reg0.05_ep40_p1.0_balanced/resolve/main/svd_model_nf32_lr0.001_reg0.05_ep40_p1.0_balanced.pkl"
 CSV_HF_URL = "https://huggingface.co/datasets/Stas2k3/Cell_Phones_and_Accessories_Train/resolve/main/Cell_Phones_and_Accessories.train.csv"
+
+# URL DỮ LIỆU ĐÃ TÍNH TOÁN TRƯỚC (RẤT QUAN TRỌNG CHO TỐC ĐỘ API)
+# BẠN CẦN THAY THẾ BẰNG URL DẪN ĐẾN FILE PICKLE CHỈ CHỨA TOP N GỢI Ý CHO MỖI USER
+PRECOMPUTED_HF_URL = "YOUR_PRECOMPUTED_TOP_K_URL_HERE" 
 
 # Đường dẫn cache tạm
 CACHE_DIR = "/tmp"
 MODEL_PATH = os.path.join(CACHE_DIR, "model.pkl")
 CSV_PATH = os.path.join(CACHE_DIR, "data.csv")
-# Đường dẫn cache mới cho danh sách Item ID đã xử lý (TỐC ĐỘ CAO)
 ITEM_IDS_PATH = os.path.join(CACHE_DIR, "item_ids.pkl")
+PRECOMPUTED_PATH = os.path.join(CACHE_DIR, "precomputed_recs.pkl")
 
-# Khởi tạo dữ liệu toàn cục (sẽ được cập nhật sau)
+# Khởi tạo dữ liệu toàn cục (sẽ được cập nhật bởi luồng nền)
 item_ids = []
 topk_model = None
+precomputed_recommendations = {} # Dữ liệu gợi ý đã tính toán trước
 
 # ==========================================================================
 # 2. Hàm tải file tối ưu RAM (stream)
@@ -41,6 +47,11 @@ def download_file_stream(url, save_path, name, max_retries=5):
     if os.path.exists(save_path):
         logging.info(f"[{name}] File đã tồn tại trong cache: {save_path}")
         return True
+    
+    # Bỏ qua nếu URL là placeholder
+    if url == "YOUR_PRECOMPUTED_TOP_K_URL_HERE":
+        logging.warning(f"[{name}] URL chưa được cấu hình. Bỏ qua tải.")
+        return False
 
     for attempt in range(max_retries):
         try:
@@ -57,7 +68,6 @@ def download_file_stream(url, save_path, name, max_retries=5):
                             downloaded += len(chunk)
                             if total_size:
                                 percent = downloaded / total_size * 100
-                                # Chỉ ghi log khi tiến độ vượt qua ngưỡng 20% mới
                                 current_major_percent = int(percent // 20) * 20
                                 if current_major_percent > last_reported_percent and current_major_percent < 100:
                                     logging.info(f"[{name}] {current_major_percent}% downloaded")
@@ -75,12 +85,11 @@ def download_file_stream(url, save_path, name, max_retries=5):
     return False
 
 # ==========================================================================
-# 3. Load dữ liệu
+# 3. Load dữ liệu (Tối ưu RAM)
 # ==========================================================================
 
 def _load_items_blocking():
-    """Tải và load danh sách item ID (Sẽ chạy nhanh nếu cache tồn tại)."""
-    # 1. Thử load từ cache nhanh ITEM_IDS_PATH
+    """Tải và load danh sách item ID (Ưu tiên load từ cache nhanh ITEM_IDS_PATH)."""
     if os.path.exists(ITEM_IDS_PATH):
         try:
             logging.info("Đang load Item IDs từ cache nhanh...")
@@ -91,21 +100,27 @@ def _load_items_blocking():
         except Exception as e:
             logging.warning(f"Lỗi đọc cache Item IDs: {e}. Sẽ load lại từ CSV.")
 
-    # 2. Nếu cache nhanh không tồn tại hoặc lỗi, fallback về CSV (quá trình chậm)
     if not download_file_stream(CSV_HF_URL, CSV_PATH, "CSV Data"):
         return []
     
     try:
         logging.info("Đọc CSV TỪ ĐĨA (quá trình chậm)...")
-        items_df = pd.read_csv(CSV_PATH)
-        # Xử lý cột parent_asin để chỉ lấy ASIN đầu tiên nếu là danh sách
+        # CHỈ TẢI CÁC CỘT CẦN THIẾT (parent_asin) ĐỂ GIẢM RAM
+        items_df = pd.read_csv(CSV_PATH, usecols=["parent_asin"])
+        
+        # Xử lý cột parent_asin
         items_df["parent_asin"] = (
             items_df["parent_asin"].astype(str).str.split(",").str[0]
         )
         unique_items = items_df["parent_asin"].dropna().unique().tolist()
         logging.info(f"✅ CSV đã load và xử lý: {len(unique_items)} items duy nhất.")
 
-        # 3. Lưu kết quả xử lý vào cache nhanh ITEM_IDS_PATH
+        # DỌN DẸP RAM SAU KHI SỬ DỤNG DATAFRAME LỚN
+        del items_df
+        gc.collect() 
+        logging.info("Bộ nhớ đã được dọn dẹp sau khi xử lý CSV.")
+
+        # Lưu kết quả xử lý vào cache nhanh ITEM_IDS_PATH
         try:
             with open(ITEM_IDS_PATH, 'wb') as f:
                 pickle.dump(unique_items, f)
@@ -119,11 +134,11 @@ def _load_items_blocking():
         return []
 
 def _load_model_blocking():
-    """Tải model pickle bằng stream (blocking operation)."""
+    """Tải model pickle (SVD) bằng stream (blocking operation)."""
     if not download_file_stream(MODEL_HF_URL, MODEL_PATH, "Model"):
         return None
     try:
-        logging.info("Đang load Model từ đĩa (quá trình chậm)...")
+        logging.info("Đang load Model từ đĩa (quá trình chậm và tốn RAM)...")
         with open(MODEL_PATH, "rb") as f:
             model = pickle.load(f)
         logging.info("✅ Model đã load thành công.")
@@ -132,69 +147,86 @@ def _load_model_blocking():
         logging.error(f"Lỗi load model: {e}")
         return None
 
+def _load_precomputed_data():
+    """Tải và load dữ liệu gợi ý đã tính toán trước (TỐC ĐỘ CAO)."""
+    if not download_file_stream(PRECOMPUTED_HF_URL, PRECOMPUTED_PATH, "Precomputed Data"):
+        return {}
+    
+    try:
+        logging.info("Đang load Dữ liệu gợi ý đã tính toán trước...")
+        with open(PRECOMPUTED_PATH, "rb") as f:
+            data = pickle.load(f)
+        logging.info(f"✅ Dữ liệu Pre-computed đã load thành công. (Số lượng users: {len(data)})")
+        return data
+    except Exception as e:
+        logging.error(f"Lỗi load dữ liệu Pre-computed: {e}")
+        return {}
+
 # ==========================================================================
 # 4. Khởi động dữ liệu bất đồng bộ (ASYNC)
 # ==========================================================================
 
 def load_data_and_model_async():
-    """Hàm mục tiêu cho luồng nền, chịu trách nhiệm load dữ liệu và model."""
-    global item_ids, topk_model
-    logging.info("🚀 Luồng nền: Bắt đầu tải Item IDs (nhanh) và Model (chậm)...")
+    """Hàm mục tiêu cho luồng nền, chịu trách nhiệm load dữ liệu và model nặng."""
+    global item_ids, topk_model, precomputed_recommendations
+    logging.info("🚀 Luồng nền: Bắt đầu tải Item IDs, Model và Dữ liệu Pre-computed...")
     
-    # 1. Tải Item IDs (Vẫn giữ synchronous vì nó đã nhanh)
+    # 1. Tải Item IDs (Sử dụng cache nhanh)
     item_ids = _load_items_blocking()
     
-    # 2. Tải Model (Phần chậm, nhưng đang chạy ở luồng nền)
+    # 2. Tải Model (Phần chậm, tốn RAM)
     topk_model = _load_model_blocking()
+    
+    # 3. Tải Dữ liệu Pre-computed (Quan trọng cho tốc độ gợi ý)
+    precomputed_recommendations = _load_precomputed_data()
     
     logging.info("✅ Luồng nền: Hoàn tất tất cả quá trình load dữ liệu.")
 
 
 # ==========================================================================
-# 5. Hàm gợi ý
+# 5. Hàm gợi ý (Sử dụng Cache)
 # ==========================================================================
 
-def get_top_k_recommendations(user_id, current_item_ids, model, k=10, blocked_items=None):
-    # Kiểm tra model trước khi chạy
-    if model is None:
-        logging.error("Model chưa được load. Không thể gợi ý.")
-        return [{"error": "Model not loaded"}]
+def get_top_k_recommendations(user_id, k=10, blocked_items=None):
+    """
+    Hàm gợi ý hiệu suất cao: Chỉ tra cứu trong dữ liệu đã tính toán trước.
+    Loại bỏ vòng lặp 95,000 phép tính chậm chạp.
+    """
+    # 1. Kiểm tra Dữ liệu Pre-computed
+    if not precomputed_recommendations:
+        # Nếu chưa load được Pre-compute, fallback về Model SVD (CHẬM)
+        if topk_model:
+            logging.warning("Sử dụng fallback gợi ý SVD (RẤT CHẬM).")
+            # Nếu người dùng đã cung cấp URL Pre-computed, nhưng nó lỗi, 
+            # chúng ta không nên chạy 95k phép tính ở đây. 
+            # Giả sử chúng ta CHỈ dựa vào Pre-computed.
+            return [{"item_id": "fallback_error", "predicted_rating": 0.0, "note": "Precomputed data missing, cannot suggest."}]
+        else:
+            return [{"error": "Model and Precomputed data not loaded"}]
+
+    user_str = str(user_id)
     
-    if not current_item_ids:
-        logging.error("Không có danh sách items. Không thể gợi ý.")
-        return [{"error": "No items available"}]
+    # 2. Tra cứu trong Cache Pre-computed
+    if user_str not in precomputed_recommendations:
+        logging.warning(f"User {user_id} không có trong cache Pre-computed.")
+        # Nếu user mới, có thể fallback về gợi ý Top Phổ Biến (chưa được cài đặt)
+        return [{"error": "User not found in precomputed cache"}]
 
+    # Lấy danh sách gợi ý đã sắp xếp cho user
+    all_recs = precomputed_recommendations[user_str]
+    
+    # 3. Áp dụng Blocked Items và giới hạn Top K
     blocked_set = set(blocked_items or [])
-    valid_items = [iid for iid in current_item_ids if iid not in blocked_set]
-    if not valid_items:
-        logging.warning("Không còn items hợp lệ sau khi loại bỏ blocked_items.")
-        return [{"error": "No valid items"}]
+    final_recs = []
+    
+    for rec in all_recs:
+        if rec['item_id'] not in blocked_set:
+            final_recs.append(rec)
+            if len(final_recs) >= k:
+                break
+                
+    return final_recs
 
-    predictions = []
-    # Lưu ý: Việc lặp qua TẤT CẢ items (94k+) và gọi predict là rất tốn thời gian.
-    # Đây vẫn là điểm cần tối ưu hóa hiệu suất sau khi giải quyết vấn đề khởi động.
-    start_time = time.time()
-    for iid in valid_items:
-        try:
-            # Model.predict() ước tính rating cho cặp (user, item)
-            # Sử dụng global topk_model được cập nhật từ luồng nền
-            pred = model.predict(uid=str(user_id), iid=str(iid)).est
-            predictions.append((iid, pred))
-        except Exception:
-            # Bỏ qua nếu item hoặc user ID không có trong dữ liệu huấn luyện
-            continue
-
-    end_time = time.time()
-    logging.info(f"Đã tạo {len(predictions)} dự đoán trong {end_time - start_time:.2f}s.")
-
-    if not predictions:
-        return [{"error": "No predictions generated"}]
-
-    predictions.sort(key=lambda x: x[1], reverse=True)
-    return [
-        {"item_id": iid, "predicted_rating": round(r, 2)}
-        for iid, r in predictions[:k]
-    ]
 
 # ==========================================================================
 # 6. API Endpoint
@@ -202,11 +234,11 @@ def get_top_k_recommendations(user_id, current_item_ids, model, k=10, blocked_it
 
 @app.route("/recommend", methods=["POST"])
 def recommend():
-    # Kiểm tra trạng thái model trước khi xử lý request
-    if topk_model is None:
-        logging.warning("Yêu cầu gợi ý thất bại: Model đang được tải.")
-        # Trả về lỗi 503 (Service Unavailable) nếu model chưa load xong
-        return jsonify({"error": "Model is still loading. Please try again in a few seconds."}), 503
+    # Kiểm tra trạng thái dữ liệu Pre-computed trước khi xử lý request
+    if not precomputed_recommendations:
+        logging.warning("Yêu cầu gợi ý thất bại: Dữ liệu Pre-computed đang được tải.")
+        # Trả về lỗi 503 (Service Unavailable) nếu dữ liệu gợi ý tốc độ cao chưa load xong
+        return jsonify({"error": "Precomputed recommendations are still loading (Model loading). Please wait a few seconds."}), 503
     
     try:
         data = request.get_json(force=True)
@@ -220,10 +252,11 @@ def recommend():
     if not user_id:
         return jsonify({"error": "user_id is required"}), 400
 
-    logging.info(f"Yêu cầu gợi ý cho user_id: {user_id}, top_k: {k}")
+    start_time = time.time()
+    recommendations = get_top_k_recommendations(user_id, k, blocked_items)
+    end_time = time.time()
 
-    # Truyền biến item_ids và topk_model đã được cập nhật bởi luồng nền
-    recommendations = get_top_k_recommendations(user_id, item_ids, topk_model, k, blocked_items)
+    logging.info(f"✅ Gợi ý cho user {user_id} hoàn tất trong {(end_time - start_time) * 1000:.2f}ms")
 
     # Thêm kiểm tra lỗi cuối cùng
     if recommendations and "error" in recommendations[0]:
@@ -233,19 +266,25 @@ def recommend():
 
 @app.route("/health", methods=["GET"])
 def health():
-    # Health check phản ánh trạng thái của model
+    # Health check phản ánh trạng thái của model và dữ liệu gợi ý (tức là đã load xong chưa)
     return jsonify({
         "status": "healthy",
-        # Trả về false trong 8-9 giây đầu
+        # Trả về false trong quá trình tải model và dữ liệu pre-computed
         "model_loaded": topk_model is not None, 
+        "precomputed_loaded": bool(precomputed_recommendations),
         "items_count": len(item_ids)
     }), 200
 
+# ==========================================================================
+# 7. Khởi động Gunicorn/WSGI (Thread Initialization)
+# ==========================================================================
+# Bắt đầu luồng nền để tải dữ liệu và model.
+# Đoạn code này chạy khi module được import bởi Gunicorn/WSGI worker.
+logging.info("🚀 Bắt đầu luồng nền tải dữ liệu...")
+threading.Thread(target=load_data_and_model_async, daemon=True).start()
+
+# Hàm main chỉ dành cho phát triển cục bộ (local development)
 if __name__ == "__main__":
-    # Bắt đầu luồng nền để tải dữ liệu và model
-    threading.Thread(target=load_data_and_model_async, daemon=True).start()
-    
-    # Server Flask bắt đầu chạy ngay lập tức
-    logging.info("✅ Server Flask bắt đầu lắng nghe cổng (Startup Time < 1s)...")
+    logging.info("✅ Chạy chế độ phát triển cục bộ (local development)...")
     port = int(os.environ.get("PORT", 8000))
     app.run(host="0.0.0.0", port=port)
