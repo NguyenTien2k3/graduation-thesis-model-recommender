@@ -24,13 +24,18 @@ RUN apt-get update && \
 # Sao chép toàn bộ mã nguồn, BAO GỒM CẢ các file lớn đã được Railway tải về
 COPY . .
 
+# BƯỚC GỠ LỖI: In ra danh sách các file trong thư mục /app để kiểm tra
+RUN echo "--- Listing files in /app directory ---" && ls -la
+
 # Thiết lập biến môi trường
 ENV PYTHONUNBUFFERED=1
 
 EXPOSE 8000
 
 # Lệnh khởi động Gunicorn đã được tối ưu của bạn
+# SỬA LỖI: Đổi tên module từ "recommendation_api" thành "app" để khớp với tên file của bạn
 CMD ["gunicorn", "-w", "1", "--preload", "--timeout", "300", \
     "--worker-tmp-dir", "/dev/shm", \
     "--max-requests", "100", "--max-requests-jitter", "10", \
-    "--bind", "0.0.0.0:8000", "recommendation_api:app"]
+    "--bind", "0.0.0.0:8000", "app:app"]
+
