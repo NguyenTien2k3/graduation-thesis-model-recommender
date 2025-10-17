@@ -20,19 +20,21 @@ FROM python:3.9-slim
 
 WORKDIR /app
 
-# Cài đặt các gói hệ thống tối thiểu cần để build thư viện Python
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc g++ \
-    && rm -rf /var/lib/apt/lists/*
-
-# Sao chép file requirements.txt
+# Sao chép file requirements.txt trước để tận dụng Docker layer cache
 COPY requirements.txt .
 
-# Cài đặt các thư viện Python (sử dụng các bước tối ưu của bạn)
-RUN pip install --no-cache-dir --upgrade pip && \
+# Tối ưu hóa: Cài đặt build dependencies, cài đặt các thư viện Python,
+# và gỡ bỏ build dependencies trong cùng MỘT layer để giảm dung lượng image cuối cùng.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends build-essential && \
+    \
+    pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir "numpy==1.24.3" "Cython<3.0" && \
     pip install --no-cache-dir --no-build-isolation "scikit-surprise==1.1.3" && \
-    pip install --no-cache-dir -r requirements.txt
+    pip install --no-cache-dir -r requirements.txt && \
+    \
+    apt-get purge -y --auto-remove build-essential && \
+    rm -rf /var/lib/apt/lists/*
 
 # Sao chép mã nguồn và DỮ LIỆU ĐÃ ĐƯỢC TẢI VỀ từ giai đoạn builder
 COPY --from=builder /app .
