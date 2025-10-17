@@ -5,7 +5,6 @@ import os
 import logging
 import requests
 import time
-import sys # Thêm sys để kiểm tra kích thước đối tượng
 
 # ==========================================================================
 # 1. Cấu hình & Hằng số
@@ -16,16 +15,14 @@ logging.basicConfig(
 
 app = Flask(__name__)
 
-# Các URL tải
+# Các URL tải model và CSV
 MODEL_HF_URL = "https://huggingface.co/Stas2k3/svd_model_nf32_lr0.001_reg0.05_ep40_p1.0_balanced/resolve/main/svd_model_nf32_lr0.001_reg0.05_ep40_p1.0_balanced.pkl"
-# 🚨 URL MỚI: Thay thế CSV bằng file pickle chứa list item IDs đã được tiền xử lý
-ITEM_IDS_HF_URL = "https://huggingface.co/datasets/Stas2k3/Cell_Phones_and_Accessories_Train/resolve/main/item_ids.pkl" 
-# Bạn cần thay URL này bằng URL của file item_ids.pkl mà bạn đã upload
+CSV_HF_URL = "https://huggingface.co/datasets/Stas2k3/Cell_Phones_and_Accessories_Train/resolve/main/Cell_Phones_and_Accessories.train.csv"
 
 # Đường dẫn cache tạm
 CACHE_DIR = "/tmp"
 MODEL_PATH = os.path.join(CACHE_DIR, "model.pkl")
-ITEM_IDS_PATH = os.path.join(CACHE_DIR, "item_ids.pkl")
+CSV_PATH = os.path.join(CACHE_DIR, "data.csv")
 
 # ==========================================================================
 # 2. Hàm tải file tối ưu RAM (stream)
@@ -43,21 +40,19 @@ def download_file_stream(url, save_path, name, max_retries=5):
             logging.info(f"[{name}] Tải từ {url} (attempt {attempt + 1})...")
             with requests.get(url, stream=True, timeout=60) as r:
                 r.raise_for_status()
-                # Thêm log kiểm tra kích thước file để theo dõi
-                total_size_bytes = int(r.headers.get("content-length", 0))
-                total_size_mb = total_size_bytes / (1024 * 1024)
-                logging.info(f"[{name}] Kích thước file: {total_size_mb:.2f} MB")
-                
+                total_size = int(r.headers.get("content-length", 0))
                 downloaded = 0
                 with open(save_path, "wb") as f:
                     for chunk in r.iter_content(chunk_size=8192):
                         if chunk:
                             f.write(chunk)
                             downloaded += len(chunk)
-                            # Bỏ log % tải xuống để giảm I/O và tăng tốc
-                            
-                logging.info(f"[{name}] ✅ Hoàn tất tải: {save_path}")
-                return True
+                            if total_size:
+                                percent = downloaded / total_size * 100
+                                if int(percent) % 20 == 0:
+                                    logging.info(f"[{name}] {percent:.0f}% downloaded")
+            logging.info(f"[{name}] ✅ Hoàn tất tải: {save_path}")
+            return True
         except Exception as e:
             logging.warning(f"[{name}] Lỗi khi tải: {e}")
             if attempt < max_retries - 1:
@@ -69,25 +64,25 @@ def download_file_stream(url, save_path, name, max_retries=5):
 
 
 # ==========================================================================
-# 3. Load dữ liệu (Đã tối ưu)
+# 3. Load dữ liệu
 # ==========================================================================
 
 
 def load_items():
-    """Tải và đọc list Item ID từ file pickle siêu nhỏ gọn."""
-    if not download_file_stream(ITEM_IDS_HF_URL, ITEM_IDS_PATH, "Item IDs"):
+    """Tải CSV bằng stream và đọc từ file."""
+    if not download_file_stream(CSV_HF_URL, CSV_PATH, "CSV Data"):
         return []
     try:
-        logging.info("Đọc Item IDs từ đĩa...")
-        with open(ITEM_IDS_PATH, "rb") as f:
-            item_ids = pickle.load(f)
-        
-        # Thêm log kiểm tra RAM sử dụng
-        size_mb = sys.getsizeof(item_ids) / (1024 * 1024)
-        logging.info(f"✅ Item IDs đã load: {len(item_ids)} items duy nhất. RAM: {size_mb:.2f} MB")
-        return item_ids
+        logging.info("Đọc CSV từ đĩa...")
+        items_df = pd.read_csv(CSV_PATH)
+        items_df["parent_asin"] = (
+            items_df["parent_asin"].astype(str).str.split(",").str[0]
+        )
+        unique_items = items_df["parent_asin"].dropna().unique().tolist()
+        logging.info(f"✅ CSV đã load: {len(unique_items)} items duy nhất.")
+        return unique_items
     except Exception as e:
-        logging.error(f"Lỗi đọc Item IDs: {e}")
+        logging.error(f"Lỗi đọc CSV: {e}")
         return []
 
 
@@ -98,10 +93,7 @@ def load_model():
     try:
         with open(MODEL_PATH, "rb") as f:
             model = pickle.load(f)
-        
-        # Thêm log kiểm tra RAM sử dụng
-        size_mb = sys.getsizeof(model) / (1024 * 1024)
-        logging.info(f"✅ Model đã load thành công. RAM: {size_mb:.2f} MB")
+        logging.info("✅ Model đã load thành công.")
         return model
     except Exception as e:
         logging.error(f"Lỗi load model: {e}")
@@ -116,10 +108,6 @@ logging.info("🚀 Khởi động server — bắt đầu load dữ liệu...")
 item_ids = load_items()
 topk_model = load_model()
 
-# Kiểm tra sau khi load
-if topk_model is None or not item_ids:
-    logging.error("🚨 Không thể load Model hoặc Item IDs. Dịch vụ sẽ bị lỗi.")
-
 # ==========================================================================
 # 5. Hàm gợi ý
 # ==========================================================================
@@ -132,35 +120,22 @@ def get_top_k_recommendations(user_id, item_ids, model, k=10, blocked_items=None
         return [{"error": "No items available"}]
 
     blocked_set = set(blocked_items or [])
-    # Chỉ giữ lại các ASIN có ít nhất một ký tự và không nằm trong blocked_set
-    valid_items = [iid for iid in item_ids if iid and iid not in blocked_set]
-    
+    valid_items = [iid for iid in item_ids if iid not in blocked_set]
     if not valid_items:
         return [{"error": "No valid items"}]
-    
-    # Giới hạn số lượng dự đoán để tránh timeout/OOM nếu list item_ids quá lớn
-    # Nếu list ID quá lớn (ví dụ > 50k), bạn nên lấy mẫu ngẫu nhiên (sampling)
-    # hoặc dùng các hàm tối ưu hơn của Surprise (get_top_n)
-    
+
     predictions = []
-    
-    # Sử dụng mô hình (Surprise SVD) để dự đoán
     for iid in valid_items:
         try:
-            # model.predict yêu cầu uid và iid là chuỗi (str)
             pred = model.predict(uid=str(user_id), iid=str(iid)).est
             predictions.append((iid, pred))
         except Exception:
-            # Bỏ qua nếu có lỗi (ví dụ: Item ID hoặc User ID không có trong mô hình)
             continue
 
     if not predictions:
-        # Nếu mô hình không tạo ra dự đoán nào cho user này
-        # Có thể dùng một chiến lược dự phòng (fallback) ở đây
-        return [{"error": "No predictions generated or user unknown"}]
+        return [{"error": "No predictions generated"}]
 
     predictions.sort(key=lambda x: x[1], reverse=True)
-    
     return [
         {"item_id": iid, "predicted_rating": round(r, 2)} for iid, r in predictions[:k]
     ]
@@ -173,22 +148,12 @@ def get_top_k_recommendations(user_id, item_ids, model, k=10, blocked_items=None
 
 @app.route("/recommend", methods=["POST"])
 def recommend():
-    try:
-        data = request.get_json(force=True)
-    except Exception as e:
-        return jsonify({"error": f"Invalid JSON payload: {e}"}), 400
-
+    data = request.get_json(force=True)
     user_id = data.get("user_id")
     k = int(data.get("top_k", 10))
-    # Sử dụng giá trị mặc định ít gây tranh cãi hơn, hoặc để rỗng
-    blocked_items = data.get("blocked_items", []) 
-    
+    blocked_items = data.get("blocked_items", ["B00K30H3O8"])
     if not user_id:
         return jsonify({"error": "user_id is required"}), 400
-    
-    if topk_model is None or not item_ids:
-        return jsonify({"error": "Service not ready: Model or Items not loaded"}), 503
-
     recommendations = get_top_k_recommendations(
         user_id, item_ids, topk_model, k, blocked_items
     )
@@ -202,7 +167,7 @@ def health():
             {
                 "status": "healthy",
                 "model_loaded": topk_model is not None,
-                "items_count": len(item_ids) if item_ids else 0,
+                "items_count": len(item_ids),
             }
         ),
         200,
@@ -211,5 +176,4 @@ def health():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
-    logging.info(f"Web server starting on port {port}")
     app.run(host="0.0.0.0", port=port)
