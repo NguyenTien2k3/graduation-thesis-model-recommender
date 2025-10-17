@@ -12,5 +12,3 @@ venv/
 *.log
 .DS_Store
 node_modules/
-!svd_model_nf32_lr0.001_reg0.05_ep40_p1.0_balanced.pkl  # Đảm bảo không bỏ qua
-!Cell_Phones_and_Accessories.train.csv  # Đảm bảo không bỏ qua
