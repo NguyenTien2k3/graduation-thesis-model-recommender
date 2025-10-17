@@ -12,3 +12,7 @@ venv/
 *.log
 .DS_Store
 node_modules/
+# Bỏ qua mọi thứ, nhưng đảm bảo 
+# svd_model_nf32_lr0.001_reg0.05_ep40_p1.0_balanced.pkl 
+# và Cell_Phones_and_Accessories.train.csv 
+# KHÔNG BỊ BỎ QUA nếu chúng ở thư mục gốc!

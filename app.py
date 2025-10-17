@@ -64,6 +64,7 @@ def load_items():
         logger.warning("⚠️ Không thể load danh sách item (CSV rỗng hoặc lỗi).")
         return []
     try:
+        # Xử lý parent_asin có thể chứa nhiều giá trị (chỉ lấy giá trị đầu)
         items_df["parent_asin"] = (
             items_df["parent_asin"].astype(str).str.split(",").str[0]
         )
@@ -95,11 +96,14 @@ def get_top_k_recommendations(user_id, item_ids, model, k=10, blocked_items=None
         return [{"error": "No valid items after filtering blocked items"}]
 
     predictions = []
+    # Chỉ tính toán rating cho các item chưa tương tác (hoặc chưa bị chặn)
     for iid in valid_items:
         try:
+            # model.predict sẽ ước tính rating (est)
             pred = model.predict(uid=user_id, iid=iid).est
             predictions.append((iid, pred))
         except Exception as e:
+            # Bỏ qua item nếu có lỗi trong quá trình dự đoán (ít xảy ra với surprise)
             logger.warning(f"⚠️ Bỏ qua item {iid} cho user {user_id}: {e}")
             continue
 
@@ -107,6 +111,7 @@ def get_top_k_recommendations(user_id, item_ids, model, k=10, blocked_items=None
         logger.warning(f"⚠️ Không tạo được gợi ý nào cho user {user_id}.")
         return [{"error": "No predictions could be made"}]
 
+    # Sắp xếp và lấy top K
     predictions.sort(key=lambda x: x[1], reverse=True)
     top_predictions = predictions[: min(k, len(predictions))]
     logger.info(f"✅ Trả về {len(top_predictions)} gợi ý cho user {user_id}.")
@@ -116,12 +121,13 @@ def get_top_k_recommendations(user_id, item_ids, model, k=10, blocked_items=None
     ]
 
 
-# ====== API /recommend ======
+# ====== API /recommend (POST) ======
 @app.route("/recommend", methods=["POST"])
 def recommend():
     logger.info("📩 Nhận yêu cầu POST /recommend")
     try:
-        data = request.get_json(force=True)
+        # force=True cho phép đọc data ngay cả khi Content-Type không phải application/json
+        data = request.get_json(force=True) 
         logger.info(f"📦 Payload nhận được: {data}")
     except Exception:
         logger.error("❌ Payload không hợp lệ.")
@@ -129,7 +135,8 @@ def recommend():
 
     user_id = data.get("user_id")
     k = data.get("top_k", 10)
-    blocked_items = data.get("blocked_items", ["B00K30H3O8"])
+    # Default blocked_items để test
+    blocked_items = data.get("blocked_items", ["B00K30H3O8"]) 
 
     if not user_id:
         return jsonify({"error": "user_id is required"}), 400
@@ -156,6 +163,7 @@ def recommend():
         logger.warning(f"⚠️ Lỗi khi tạo gợi ý cho user {user_id}: {recommendations[0]}")
         return jsonify(recommendations[0]), 500
 
+    # Định dạng kết quả đầu ra
     results = [
         {
             "user_id": user_id,
@@ -169,7 +177,7 @@ def recommend():
     return jsonify(results), 200
 
 
-# ====== API /health ======
+# ====== API /health (GET) ======
 @app.route("/health", methods=["GET"])
 def health():
     logger.info("🔍 Kiểm tra tình trạng hệ thống (/health)")
@@ -186,6 +194,8 @@ def health():
 
 
 if __name__ == "__main__":
+    # Dùng cổng từ biến môi trường PORT (Railway sẽ cung cấp) hoặc mặc định 8000
     port = int(os.environ.get("PORT", 8000))
     logger.info(f"🚀 Server đang chạy tại http://0.0.0.0:{port}")
+    # Khi chạy cục bộ, dùng app.run. Trong Docker, Gunicorn sẽ chạy app.
     app.run(host="0.0.0.0", port=port)
