@@ -1,21 +1,6 @@
-# Giai đoạn 1: Builder - Tải các file lớn từ Git LFS
-FROM python:3.9-slim as builder
+# Dockerfile này giả định rằng lệnh 'git lfs pull' đã được chạy TRƯỚC KHI build.
+# Hãy sử dụng tính năng "Build Command" của Railway để làm việc này.
 
-# Cài đặt các gói hệ thống cần thiết: git và git-lfs
-RUN apt-get update && apt-get install -y --no-install-recommends git git-lfs && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /app
-
-# Sao chép toàn bộ project (quan trọng: bao gồm cả thư mục .git)
-COPY . .
-
-# Chạy lệnh git lfs để tải về các file thật
-# Nếu lệnh này thất bại, quá trình build sẽ dừng lại
-RUN git lfs install && git lfs pull
-
-# ---
-
-# Giai đoạn 2: Final Image - Xây dựng môi trường chạy ứng dụng
 FROM python:3.9-slim
 
 WORKDIR /app
@@ -36,8 +21,8 @@ RUN apt-get update && \
     apt-get purge -y --auto-remove build-essential && \
     rm -rf /var/lib/apt/lists/*
 
-# Sao chép mã nguồn và DỮ LIỆU ĐÃ ĐƯỢC TẢI VỀ từ giai đoạn builder
-COPY --from=builder /app .
+# Sao chép toàn bộ mã nguồn, BAO GỒM CẢ các file lớn đã được Railway tải về
+COPY . .
 
 # Thiết lập biến môi trường
 ENV PYTHONUNBUFFERED=1
@@ -45,7 +30,6 @@ ENV PYTHONUNBUFFERED=1
 EXPOSE 8000
 
 # Lệnh khởi động Gunicorn đã được tối ưu của bạn
-# Sửa lại thành "recommendation_api:app" để khớp với tên file python
 CMD ["gunicorn", "-w", "1", "--preload", "--timeout", "300", \
     "--worker-tmp-dir", "/dev/shm", \
     "--max-requests", "100", "--max-requests-jitter", "10", \
