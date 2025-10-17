@@ -13,6 +13,7 @@ logging.basicConfig(
 
 app = Flask(__name__)
 
+
 # ====== Hàm load model an toàn ======
 def safe_load_pickle(url_or_path, name):
     try:
@@ -27,9 +28,11 @@ def safe_load_pickle(url_or_path, name):
         logging.error(f"Error loading '{url_or_path}' for {name}: {e}. Skipping load.")
         return None
 
+
 # Load model SVD Top-K từ Hugging Face
 model_url = "./svd_model_nf32_lr0.001_reg0.05_ep40_p1.0_balanced.pkl"
 topk_model = safe_load_pickle(model_url, "Top-K SVD model")
+
 
 # ====== Hàm load CSV an toàn ======
 def safe_load_csv(url_or_path):
@@ -43,6 +46,7 @@ def safe_load_csv(url_or_path):
     except Exception as e:
         logging.error(f"Error loading CSV from '{url_or_path}': {e}.")
         return None
+
 
 def load_items():
     csv_url = "./Cell_Phones_and_Accessories.train.csv"
@@ -62,6 +66,7 @@ def load_items():
 
 
 item_ids = load_items()
+
 
 # ====== Logic gợi ý top-K ======
 def get_top_k_recommendations(user_id, item_ids, model, k=10, blocked_items=None):
@@ -95,6 +100,7 @@ def get_top_k_recommendations(user_id, item_ids, model, k=10, blocked_items=None
         {"item_id": iid, "predicted_rating": round(r, 2)}
         for iid, r in predictions[: min(k, len(predictions))]
     ]
+
 
 # ====== API /recommend ======
 @app.route("/recommend", methods=["POST"])
@@ -140,6 +146,7 @@ def recommend():
     ]
     return jsonify(results), 200
 
+
 # ====== API /health ======
 @app.route("/health", methods=["GET"])
 def health():
@@ -153,6 +160,7 @@ def health():
         ),
         200,
     )
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
