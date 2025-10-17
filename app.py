@@ -5,6 +5,7 @@ import os
 import logging
 import requests
 import time
+import threading # <-- Import mới để chạy nền
 
 # ==========================================================================
 # 1. Cấu hình & Hằng số
@@ -27,8 +28,12 @@ CSV_PATH = os.path.join(CACHE_DIR, "data.csv")
 # Đường dẫn cache mới cho danh sách Item ID đã xử lý (TỐC ĐỘ CAO)
 ITEM_IDS_PATH = os.path.join(CACHE_DIR, "item_ids.pkl")
 
+# Khởi tạo dữ liệu toàn cục (sẽ được cập nhật sau)
+item_ids = []
+topk_model = None
+
 # ==========================================================================
-# 2. Hàm tải file tối ưu RAM (stream) - Đã sửa lỗi giới hạn log
+# 2. Hàm tải file tối ưu RAM (stream)
 # ==========================================================================
 
 def download_file_stream(url, save_path, name, max_retries=5):
@@ -70,14 +75,11 @@ def download_file_stream(url, save_path, name, max_retries=5):
     return False
 
 # ==========================================================================
-# 3. Load dữ liệu - Đã tối ưu tốc độ load Item ID
+# 3. Load dữ liệu
 # ==========================================================================
 
-def load_items():
-    """
-    Tải và load danh sách item ID. Ưu tiên load từ file cache pickle đã xử lý (ITEM_IDS_PATH)
-    để tránh đọc lại CSV bằng Pandas (chậm).
-    """
+def _load_items_blocking():
+    """Tải và load danh sách item ID (Sẽ chạy nhanh nếu cache tồn tại)."""
     # 1. Thử load từ cache nhanh ITEM_IDS_PATH
     if os.path.exists(ITEM_IDS_PATH):
         try:
@@ -116,12 +118,12 @@ def load_items():
         logging.error(f"Lỗi đọc CSV: {e}")
         return []
 
-def load_model():
-    """Tải model pickle bằng stream."""
+def _load_model_blocking():
+    """Tải model pickle bằng stream (blocking operation)."""
     if not download_file_stream(MODEL_HF_URL, MODEL_PATH, "Model"):
         return None
     try:
-        logging.info("Đang load Model từ đĩa...")
+        logging.info("Đang load Model từ đĩa (quá trình chậm)...")
         with open(MODEL_PATH, "rb") as f:
             model = pickle.load(f)
         logging.info("✅ Model đã load thành công.")
@@ -131,40 +133,51 @@ def load_model():
         return None
 
 # ==========================================================================
-# 4. Khởi động dữ liệu toàn cục
+# 4. Khởi động dữ liệu bất đồng bộ (ASYNC)
 # ==========================================================================
 
-logging.info("🚀 Khởi động server — bắt đầu load dữ liệu...")
-# Lưu ý: Các biến này sẽ được khởi tạo lại nếu ứng dụng bị crash và restart
-item_ids = load_items()
-topk_model = load_model()
+def load_data_and_model_async():
+    """Hàm mục tiêu cho luồng nền, chịu trách nhiệm load dữ liệu và model."""
+    global item_ids, topk_model
+    logging.info("🚀 Luồng nền: Bắt đầu tải Item IDs (nhanh) và Model (chậm)...")
+    
+    # 1. Tải Item IDs (Vẫn giữ synchronous vì nó đã nhanh)
+    item_ids = _load_items_blocking()
+    
+    # 2. Tải Model (Phần chậm, nhưng đang chạy ở luồng nền)
+    topk_model = _load_model_blocking()
+    
+    logging.info("✅ Luồng nền: Hoàn tất tất cả quá trình load dữ liệu.")
+
 
 # ==========================================================================
 # 5. Hàm gợi ý
 # ==========================================================================
 
-def get_top_k_recommendations(user_id, item_ids, model, k=10, blocked_items=None):
+def get_top_k_recommendations(user_id, current_item_ids, model, k=10, blocked_items=None):
+    # Kiểm tra model trước khi chạy
     if model is None:
         logging.error("Model chưa được load. Không thể gợi ý.")
         return [{"error": "Model not loaded"}]
-    if not item_ids:
+    
+    if not current_item_ids:
         logging.error("Không có danh sách items. Không thể gợi ý.")
         return [{"error": "No items available"}]
 
     blocked_set = set(blocked_items or [])
-    valid_items = [iid for iid in item_ids if iid not in blocked_set]
+    valid_items = [iid for iid in current_item_ids if iid not in blocked_set]
     if not valid_items:
         logging.warning("Không còn items hợp lệ sau khi loại bỏ blocked_items.")
         return [{"error": "No valid items"}]
 
     predictions = []
     # Lưu ý: Việc lặp qua TẤT CẢ items (94k+) và gọi predict là rất tốn thời gian.
-    # Trong môi trường sản xuất, bạn nên dùng Ma trận Gần kề Item-Item
-    # hoặc truy vấn trực tiếp từ model SVD nếu model hỗ trợ lấy Top-K hiệu quả hơn.
+    # Đây vẫn là điểm cần tối ưu hóa hiệu suất sau khi giải quyết vấn đề khởi động.
     start_time = time.time()
     for iid in valid_items:
         try:
             # Model.predict() ước tính rating cho cặp (user, item)
+            # Sử dụng global topk_model được cập nhật từ luồng nền
             pred = model.predict(uid=str(user_id), iid=str(iid)).est
             predictions.append((iid, pred))
         except Exception:
@@ -189,6 +202,12 @@ def get_top_k_recommendations(user_id, item_ids, model, k=10, blocked_items=None
 
 @app.route("/recommend", methods=["POST"])
 def recommend():
+    # Kiểm tra trạng thái model trước khi xử lý request
+    if topk_model is None:
+        logging.warning("Yêu cầu gợi ý thất bại: Model đang được tải.")
+        # Trả về lỗi 503 (Service Unavailable) nếu model chưa load xong
+        return jsonify({"error": "Model is still loading. Please try again in a few seconds."}), 503
+    
     try:
         data = request.get_json(force=True)
     except Exception as e:
@@ -203,23 +222,30 @@ def recommend():
 
     logging.info(f"Yêu cầu gợi ý cho user_id: {user_id}, top_k: {k}")
 
+    # Truyền biến item_ids và topk_model đã được cập nhật bởi luồng nền
     recommendations = get_top_k_recommendations(user_id, item_ids, topk_model, k, blocked_items)
 
-    # Thêm kiểm tra lỗi nếu model hoặc item không load
+    # Thêm kiểm tra lỗi cuối cùng
     if recommendations and "error" in recommendations[0]:
-        return jsonify({"error": recommendations[0]["error"]}), 503 # Service Unavailable
+        return jsonify({"error": recommendations[0]["error"]}), 500
 
     return jsonify(recommendations), 200
 
 @app.route("/health", methods=["GET"])
 def health():
+    # Health check phản ánh trạng thái của model
     return jsonify({
         "status": "healthy",
-        "model_loaded": topk_model is not None,
-        "items_count": len(item_ids) if item_ids else 0
+        # Trả về false trong 8-9 giây đầu
+        "model_loaded": topk_model is not None, 
+        "items_count": len(item_ids)
     }), 200
 
 if __name__ == "__main__":
+    # Bắt đầu luồng nền để tải dữ liệu và model
+    threading.Thread(target=load_data_and_model_async, daemon=True).start()
+    
+    # Server Flask bắt đầu chạy ngay lập tức
+    logging.info("✅ Server Flask bắt đầu lắng nghe cổng (Startup Time < 1s)...")
     port = int(os.environ.get("PORT", 8000))
-    # Sử dụng `threaded=True` là mặc định cho Flask
     app.run(host="0.0.0.0", port=port)
