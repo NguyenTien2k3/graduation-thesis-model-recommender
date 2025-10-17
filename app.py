@@ -118,11 +118,11 @@ def load_items():
 
 
 # ==============================================================================
-# 3. Load Model và Item Data VÀO BỘ NHỚ (Chỉ chạy 1 lần khi app khởi động)
+# 3. Load Model và Item Data VÀO BỘ NHỚ (Đã đảo thứ tự để chẩn đoán OOM)
 # ==============================================================================
 
-topk_model = safe_load_pickle(MODEL_HF_URL, "Top-K SVD model")
 item_ids = load_items()
+topk_model = safe_load_pickle(MODEL_HF_URL, "Top-K SVD model")
 
 
 # ==============================================================================
