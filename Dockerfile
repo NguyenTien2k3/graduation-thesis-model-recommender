@@ -9,7 +9,6 @@ COPY . .
 
 # ===== GIAI ĐOẠN 2: FINAL IMAGE - XÂY DỰNG ỨNG DỤNG =====
 # Stage này sẽ tạo ra image cuối cùng để chạy
-# SỬA LỖI: Chuyển sang base image đầy đủ hơn để giải quyết lỗi tương thích của scipy
 FROM python:3.9
 
 WORKDIR /app
@@ -35,11 +34,6 @@ COPY --from=builder /app .
 # Thiết lập biến môi trường
 ENV PYTHONUNBUFFERED=1
 
-EXPOSE 8000
-
-# Lệnh khởi động Gunicorn, chạy file app.py của bạn
-CMD ["gunicorn", "-w", "1", "--preload", "--timeout", "300", \
-    "--worker-tmp-dir", "/dev/shm", \
-    "--max-requests", "100", "--max-requests-jitter", "10", \
-    "--bind", "0.0.0.0:8000", "app:app"]
-
+# SỬA LỖI: Chuyển sang "shell form" của CMD để biến $PORT được nhận diện.
+# Gunicorn cần biến $PORT do Railway cung cấp để hoạt động đúng.
+CMD gunicorn --bind 0.0.0.0:$PORT --workers 1 --preload --timeout 300 --worker-tmp-dir /dev/shm --max-requests 100 --max-requests-jitter 10 app:app
