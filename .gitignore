@@ -1,0 +1,10 @@
+# Bỏ qua thư mục cache của Python
+__pycache__/
+
+# Bỏ qua các file môi trường ảo (nếu có)
+.venv/
+venv/
+env/
+
+# Các file hệ điều hành
+.DS_Store
