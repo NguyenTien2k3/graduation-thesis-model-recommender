@@ -4,255 +4,170 @@ from flask import Flask, request, jsonify
 import os
 import logging
 import requests
-import io  # Để đọc CSV từ bytes
-import time  # Thêm thư viện time cho cơ chế backoff
+import time
 
-# ==============================================================================
+# ==========================================================================
 # 1. Cấu hình & Hằng số
-# ==============================================================================
-
-# Cấu hình logging
+# ==========================================================================
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
 app = Flask(__name__)
 
-# Các URL Hugging Face (Sử dụng link trực tiếp)
+# Các URL tải model và CSV
 MODEL_HF_URL = "https://huggingface.co/Stas2k3/svd_model_nf32_lr0.001_reg0.05_ep40_p1.0_balanced/resolve/main/svd_model_nf32_lr0.001_reg0.05_ep40_p1.0_balanced.pkl"
 CSV_HF_URL = "https://huggingface.co/datasets/Stas2k3/Cell_Phones_and_Accessories_Train/resolve/main/Cell_Phones_and_Accessories.train.csv"
 
+# Đường dẫn cache tạm
+CACHE_DIR = "/tmp"
+MODEL_PATH = os.path.join(CACHE_DIR, "model.pkl")
+CSV_PATH = os.path.join(CACHE_DIR, "data.csv")
 
-# ==============================================================================
-# 2. Hàm load an toàn (chỉ tải 1 lần)
-# ==============================================================================
-
-
-def safe_load_pickle(url, name, max_retries=5):  # Tăng lên 5 lần thử lại
-    """Tải mô hình pickle từ URL với cơ chế thử lại (retry) và tạm dừng (backoff)."""
-    logging.info(f"Attempting to load {name} model from URL: {url}")
-
-    for attempt in range(max_retries):
-        try:
-            logging.info(f"[{name}] Attempt {attempt + 1}/{max_retries}...")
-            # Giảm timeout request xuống 60s để lỗi xảy ra sớm hơn và retry được kích hoạt
-            response = requests.get(url, timeout=60)
-            response.raise_for_status()  # Báo lỗi nếu mã trạng thái là 4xx hoặc 5xx
-            logging.info(f"[{name}] Successfully loaded after {attempt + 1} attempts.")
-            return pickle.loads(response.content)
-
-        except requests.exceptions.RequestException as e:
-            # Bắt các lỗi mạng, timeout, hoặc HTTP (4xx/5xx)
-            logging.warning(f"[{name}] Attempt {attempt + 1} failed: {e}")
-            if attempt < max_retries - 1:
-                # Độ trễ lũy thừa: 2s, 4s, 8s, 16s...
-                wait_time = 2 ** (attempt + 1)
-                logging.info(
-                    f"[{name}] Waiting for {wait_time} seconds before retrying..."
-                )
-                time.sleep(wait_time)
-            else:
-                logging.error(
-                    f"[{name}] Failed to load model after {max_retries} attempts."
-                )
-                return None
-        except Exception as e:
-            # Bắt lỗi pickle.loads hoặc lỗi không mong muốn khác
-            logging.error(f"[{name}] Deserialization or unexpected error: {e}")
-            return None
-    return None
+# ==========================================================================
+# 2. Hàm tải file tối ưu RAM (stream)
+# ==========================================================================
 
 
-def safe_load_csv(url, max_retries=5):  # Tăng lên 5 lần thử lại
-    """Tải và đọc dữ liệu CSV từ URL với cơ chế thử lại (retry) và tạm dừng (backoff)."""
-    logging.info(f"Attempting to load CSV data from URL: {url}")
+def download_file_stream(url, save_path, name, max_retries=5):
+    """Tải file theo luồng (stream) để tránh tốn RAM."""
+    if os.path.exists(save_path):
+        logging.info(f"[{name}] File đã tồn tại trong cache: {save_path}")
+        return True
 
     for attempt in range(max_retries):
         try:
-            logging.info(f"[CSV Data] Attempt {attempt + 1}/{max_retries}...")
-            response = requests.get(url, timeout=60)
-            response.raise_for_status()
-            logging.info(
-                f"[CSV Data] Successfully loaded after {attempt + 1} attempts."
-            )
-            # Sử dụng io.BytesIO để đọc dữ liệu CSV từ bytes trong bộ nhớ
-            return pd.read_csv(io.BytesIO(response.content))
-
-        except requests.exceptions.RequestException as e:
-            logging.warning(f"[CSV Data] Attempt {attempt + 1} failed: {e}")
-            if attempt < max_retries - 1:
-                wait_time = 2 ** (attempt + 1)
-                logging.info(
-                    f"[CSV Data] Waiting for {wait_time} seconds before retrying..."
-                )
-                time.sleep(wait_time)
-            else:
-                logging.error(
-                    f"[CSV Data] Failed to load CSV after {max_retries} attempts."
-                )
-                return None
+            logging.info(f"[{name}] Tải từ {url} (attempt {attempt + 1})...")
+            with requests.get(url, stream=True, timeout=60) as r:
+                r.raise_for_status()
+                total_size = int(r.headers.get("content-length", 0))
+                downloaded = 0
+                with open(save_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            if total_size:
+                                percent = downloaded / total_size * 100
+                                if int(percent) % 20 == 0:
+                                    logging.info(f"[{name}] {percent:.0f}% downloaded")
+            logging.info(f"[{name}] ✅ Hoàn tất tải: {save_path}")
+            return True
         except Exception as e:
-            logging.error(f"[CSV Data] Error processing CSV data: {e}")
-            return None
-    return None
+            logging.warning(f"[{name}] Lỗi khi tải: {e}")
+            if attempt < max_retries - 1:
+                wait = 2 ** (attempt + 1)
+                logging.info(f"[{name}] Đợi {wait}s trước khi retry...")
+                time.sleep(wait)
+    logging.error(f"[{name}] ❌ Tải thất bại sau {max_retries} lần.")
+    return False
+
+
+# ==========================================================================
+# 3. Load dữ liệu
+# ==========================================================================
 
 
 def load_items():
-    """Tải CSV, xử lý và trích xuất danh sách item ID duy nhất."""
-    items_df = safe_load_csv(CSV_HF_URL)
-    if items_df is None:
+    """Tải CSV bằng stream và đọc từ file."""
+    if not download_file_stream(CSV_HF_URL, CSV_PATH, "CSV Data"):
         return []
     try:
-        # Xử lý cột 'parent_asin': chuyển sang string và lấy ID đầu tiên
+        logging.info("Đọc CSV từ đĩa...")
+        items_df = pd.read_csv(CSV_PATH)
         items_df["parent_asin"] = (
             items_df["parent_asin"].astype(str).str.split(",").str[0]
         )
         unique_items = items_df["parent_asin"].dropna().unique().tolist()
-        logging.info(
-            f"Successfully loaded and processed {len(unique_items)} unique items"
-        )
+        logging.info(f"✅ CSV đã load: {len(unique_items)} items duy nhất.")
         return unique_items
     except Exception as e:
-        logging.error(f"Error processing CSV data columns: {e}.")
+        logging.error(f"Lỗi đọc CSV: {e}")
         return []
 
 
-# ==============================================================================
-# 3. Load Model và Item Data VÀO BỘ NHỚ (Đã đảo thứ tự để chẩn đoán OOM)
-# ==============================================================================
+def load_model():
+    """Tải model pickle bằng stream."""
+    if not download_file_stream(MODEL_HF_URL, MODEL_PATH, "Model"):
+        return None
+    try:
+        with open(MODEL_PATH, "rb") as f:
+            model = pickle.load(f)
+        logging.info("✅ Model đã load thành công.")
+        return model
+    except Exception as e:
+        logging.error(f"Lỗi load model: {e}")
+        return None
 
+
+# ==========================================================================
+# 4. Khởi động dữ liệu toàn cục
+# ==========================================================================
+
+logging.info("🚀 Khởi động server — bắt đầu load dữ liệu...")
 item_ids = load_items()
-topk_model = safe_load_pickle(MODEL_HF_URL, "Top-K SVD model")
+topk_model = load_model()
 
-
-# ==============================================================================
-# 4. Logic Gợi ý
-# ==============================================================================
+# ==========================================================================
+# 5. Hàm gợi ý
+# ==========================================================================
 
 
 def get_top_k_recommendations(user_id, item_ids, model, k=10, blocked_items=None):
-    """
-    Tạo gợi ý Top-K cho một người dùng bằng cách dự đoán rating cho các item chưa thấy.
-    """
     if model is None:
         return [{"error": "Model not loaded"}]
     if not item_ids:
         return [{"error": "No items available"}]
 
     blocked_set = set(blocked_items or [])
-    # Lọc bỏ các item đã bị chặn
     valid_items = [iid for iid in item_ids if iid not in blocked_set]
-
     if not valid_items:
-        return [{"error": "No valid items after filtering blocked items"}]
+        return [{"error": "No valid items"}]
 
     predictions = []
-    seen_items = set()
-
     for iid in valid_items:
-        if iid in seen_items:
-            continue
         try:
-            # Dự đoán rating cho cặp (user, item)
             pred = model.predict(uid=str(user_id), iid=str(iid)).est
             predictions.append((iid, pred))
-            seen_items.add(iid)
-        except Exception as e:
-            # Bỏ qua nếu mô hình không thể dự đoán cho item này (ví dụ: item/user mới)
-            logging.warning(
-                f"Skipping prediction for item {iid} for user {user_id}: {e}"
-            )
+        except Exception:
             continue
 
     if not predictions:
-        return [
-            {
-                "error": f"Could not generate any predictions for user {user_id}. Model may not recognize user/items."
-            }
-        ]
+        return [{"error": "No predictions generated"}]
 
-    # Sắp xếp theo rating giảm dần và giới hạn K
     predictions.sort(key=lambda x: x[1], reverse=True)
-
     return [
-        {"item_id": iid, "predicted_rating": round(r, 2)}
-        for iid, r in predictions[: min(k, len(predictions))]
+        {"item_id": iid, "predicted_rating": round(r, 2)} for iid, r in predictions[:k]
     ]
 
 
-# ==============================================================================
-# 5. Các API Endpoint
-# ==============================================================================
+# ==========================================================================
+# 6. API Endpoint
+# ==========================================================================
 
 
 @app.route("/recommend", methods=["POST"])
 def recommend():
-    """Endpoint để nhận ID người dùng và trả về gợi ý Top-K."""
-    try:
-        # force=True cho phép xử lý ngay cả khi Content-Type không chính xác
-        data = request.get_json(force=True)
-    except Exception:
-        return jsonify({"error": "Invalid JSON payload"}), 400
-
+    data = request.get_json(force=True)
     user_id = data.get("user_id")
-    k = data.get("top_k", 10)
-    blocked_items = data.get("blocked_items", [])  # Mặc định là list rỗng
-
+    k = int(data.get("top_k", 10))
+    blocked_items = data.get("blocked_items", ["B00K30H3O8"])
     if not user_id:
         return jsonify({"error": "user_id is required"}), 400
-    if topk_model is None:
-        # Trả về lỗi 500 nếu mô hình chưa được tải thành công lúc khởi động
-        return (
-            jsonify(
-                {"error": "Model not loaded on server. Check logs for startup errors."}
-            ),
-            500,
-        )
-    if not item_ids:
-        return (
-            jsonify({"error": "No items available (check data file load status)"}),
-            500,
-        )
-
-    try:
-        k = max(1, int(k))
-    except (ValueError, TypeError):
-        return jsonify({"error": "top_k must be a positive integer"}), 400
-
-    if not isinstance(blocked_items, list) or not all(
-        isinstance(iid, str) for iid in blocked_items
-    ):
-        return jsonify({"error": "blocked_items must be a list of string IDs"}), 400
-
-    # Sử dụng các biến toàn cục đã được tải sẵn
     recommendations = get_top_k_recommendations(
         user_id, item_ids, topk_model, k, blocked_items
     )
-
-    if recommendations and "error" in recommendations[0]:
-        return jsonify(recommendations[0]), 500
-
-    results = [
-        {
-            "user_id": user_id,
-            "parent_asin": rec["item_id"],
-            "predicted_rating": rec["predicted_rating"],
-        }
-        for rec in recommendations
-    ]
-    return jsonify(results), 200
+    return jsonify(recommendations), 200
 
 
 @app.route("/health", methods=["GET"])
 def health():
-    """Endpoint kiểm tra trạng thái của ứng dụng và mô hình."""
     return (
         jsonify(
             {
                 "status": "healthy",
                 "model_loaded": topk_model is not None,
                 "items_count": len(item_ids),
-                "model_source": MODEL_HF_URL,
             }
         ),
         200,
@@ -260,7 +175,5 @@ def health():
 
 
 if __name__ == "__main__":
-    # Flask lắng nghe trên cổng được cung cấp bởi môi trường (Railway)
     port = int(os.environ.get("PORT", 8000))
-    # Sử dụng host 0.0.0.0 để ứng dụng có thể được truy cập bên ngoài container
     app.run(host="0.0.0.0", port=port)
