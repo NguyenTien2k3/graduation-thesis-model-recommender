@@ -17,7 +17,7 @@ logging.basicConfig(
 app = Flask(__name__)
 
 # Lấy token từ biến môi trường (nếu có)
-HF_TOKEN = os.environ.get("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")
+HF_TOKEN = os.environ.get("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")
 
 # Các URL tải model và CSV
 # LƯU Ý QUAN TRỌNG: Nếu model là PRIVATE, biến môi trường HF_TOKEN phải được thiết lập.
