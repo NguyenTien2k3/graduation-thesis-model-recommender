@@ -2,14 +2,17 @@ FROM python:3.9-slim
 
 WORKDIR /app
 
-# Minimal system dependencies
+# Install system dependencies, INCLUDING git
+# This is the main fix for your error
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc g++ \
+    gcc \
+    g++ \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /app/
 
-# Install dependencies (tối ưu layer caching)
+# Install dependencies (your optimized layer caching is good)
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir "numpy==1.24.3" "Cython<3.0" && \
     pip install --no-cache-dir --no-build-isolation "scikit-surprise==1.1.3" && \
