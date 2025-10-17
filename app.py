@@ -9,6 +9,7 @@ import time
 # ==========================================================================
 # 1. Cấu hình & Hằng số
 # ==========================================================================
+# Thiết lập cấu hình log cơ bản
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
@@ -25,12 +26,11 @@ MODEL_PATH = os.path.join(CACHE_DIR, "model.pkl")
 CSV_PATH = os.path.join(CACHE_DIR, "data.csv")
 
 # ==========================================================================
-# 2. Hàm tải file tối ưu RAM (stream)
+# 2. Hàm tải file tối ưu RAM (stream) - Đã sửa lỗi giới hạn log
 # ==========================================================================
 
-
 def download_file_stream(url, save_path, name, max_retries=5):
-    """Tải file theo luồng (stream) để tránh tốn RAM."""
+    """Tải file theo luồng (stream) để tránh tốn RAM và giảm tần suất ghi log."""
     if os.path.exists(save_path):
         logging.info(f"[{name}] File đã tồn tại trong cache: {save_path}")
         return True
@@ -38,6 +38,7 @@ def download_file_stream(url, save_path, name, max_retries=5):
     for attempt in range(max_retries):
         try:
             logging.info(f"[{name}] Tải từ {url} (attempt {attempt + 1})...")
+            last_reported_percent = -1
             with requests.get(url, stream=True, timeout=60) as r:
                 r.raise_for_status()
                 total_size = int(r.headers.get("content-length", 0))
@@ -49,8 +50,12 @@ def download_file_stream(url, save_path, name, max_retries=5):
                             downloaded += len(chunk)
                             if total_size:
                                 percent = downloaded / total_size * 100
-                                if int(percent) % 20 == 0:
-                                    logging.info(f"[{name}] {percent:.0f}% downloaded")
+                                # Chỉ ghi log khi tiến độ vượt qua ngưỡng 20% mới
+                                current_major_percent = int(percent // 20) * 20
+                                if current_major_percent > last_reported_percent and current_major_percent < 100:
+                                    logging.info(f"[{name}] {current_major_percent}% downloaded")
+                                    last_reported_percent = current_major_percent
+
             logging.info(f"[{name}] ✅ Hoàn tất tải: {save_path}")
             return True
         except Exception as e:
@@ -62,11 +67,9 @@ def download_file_stream(url, save_path, name, max_retries=5):
     logging.error(f"[{name}] ❌ Tải thất bại sau {max_retries} lần.")
     return False
 
-
 # ==========================================================================
 # 3. Load dữ liệu
 # ==========================================================================
-
 
 def load_items():
     """Tải CSV bằng stream và đọc từ file."""
@@ -75,6 +78,7 @@ def load_items():
     try:
         logging.info("Đọc CSV từ đĩa...")
         items_df = pd.read_csv(CSV_PATH)
+        # Xử lý cột parent_asin để chỉ lấy ASIN đầu tiên nếu là danh sách
         items_df["parent_asin"] = (
             items_df["parent_asin"].astype(str).str.split(",").str[0]
         )
@@ -84,7 +88,6 @@ def load_items():
     except Exception as e:
         logging.error(f"Lỗi đọc CSV: {e}")
         return []
-
 
 def load_model():
     """Tải model pickle bằng stream."""
@@ -99,12 +102,12 @@ def load_model():
         logging.error(f"Lỗi load model: {e}")
         return None
 
-
 # ==========================================================================
 # 4. Khởi động dữ liệu toàn cục
 # ==========================================================================
 
 logging.info("🚀 Khởi động server — bắt đầu load dữ liệu...")
+# Lưu ý: Các biến này sẽ được khởi tạo lại nếu ứng dụng bị crash và restart
 item_ids = load_items()
 topk_model = load_model()
 
@@ -112,68 +115,83 @@ topk_model = load_model()
 # 5. Hàm gợi ý
 # ==========================================================================
 
-
 def get_top_k_recommendations(user_id, item_ids, model, k=10, blocked_items=None):
     if model is None:
+        logging.error("Model chưa được load. Không thể gợi ý.")
         return [{"error": "Model not loaded"}]
     if not item_ids:
+        logging.error("Không có danh sách items. Không thể gợi ý.")
         return [{"error": "No items available"}]
 
     blocked_set = set(blocked_items or [])
     valid_items = [iid for iid in item_ids if iid not in blocked_set]
     if not valid_items:
+        logging.warning("Không còn items hợp lệ sau khi loại bỏ blocked_items.")
         return [{"error": "No valid items"}]
 
     predictions = []
+    # Lưu ý: Việc lặp qua TẤT CẢ items (94k+) và gọi predict là rất tốn thời gian.
+    # Trong môi trường sản xuất, bạn nên dùng Ma trận Gần kề Item-Item
+    # hoặc truy vấn trực tiếp từ model SVD nếu model hỗ trợ lấy Top-K hiệu quả hơn.
+    start_time = time.time()
     for iid in valid_items:
         try:
+            # Model.predict() ước tính rating cho cặp (user, item)
             pred = model.predict(uid=str(user_id), iid=str(iid)).est
             predictions.append((iid, pred))
         except Exception:
+            # Bỏ qua nếu item hoặc user ID không có trong dữ liệu huấn luyện
             continue
+
+    end_time = time.time()
+    logging.info(f"Đã tạo {len(predictions)} dự đoán trong {end_time - start_time:.2f}s.")
 
     if not predictions:
         return [{"error": "No predictions generated"}]
 
     predictions.sort(key=lambda x: x[1], reverse=True)
     return [
-        {"item_id": iid, "predicted_rating": round(r, 2)} for iid, r in predictions[:k]
+        {"item_id": iid, "predicted_rating": round(r, 2)}
+        for iid, r in predictions[:k]
     ]
-
 
 # ==========================================================================
 # 6. API Endpoint
 # ==========================================================================
 
-
 @app.route("/recommend", methods=["POST"])
 def recommend():
-    data = request.get_json(force=True)
+    try:
+        data = request.get_json(force=True)
+    except Exception as e:
+        return jsonify({"error": f"Invalid JSON payload: {e}"}), 400
+
     user_id = data.get("user_id")
     k = int(data.get("top_k", 10))
-    blocked_items = data.get("blocked_items", ["B00K30H3O8"])
+    blocked_items = data.get("blocked_items", [])
+
     if not user_id:
         return jsonify({"error": "user_id is required"}), 400
-    recommendations = get_top_k_recommendations(
-        user_id, item_ids, topk_model, k, blocked_items
-    )
-    return jsonify(recommendations), 200
 
+    logging.info(f"Yêu cầu gợi ý cho user_id: {user_id}, top_k: {k}")
+
+    recommendations = get_top_k_recommendations(user_id, item_ids, topk_model, k, blocked_items)
+
+    # Thêm kiểm tra lỗi nếu model hoặc item không load
+    if recommendations and "error" in recommendations[0]:
+        return jsonify({"error": recommendations[0]["error"]}), 503 # Service Unavailable
+
+    return jsonify(recommendations), 200
 
 @app.route("/health", methods=["GET"])
 def health():
-    return (
-        jsonify(
-            {
-                "status": "healthy",
-                "model_loaded": topk_model is not None,
-                "items_count": len(item_ids),
-            }
-        ),
-        200,
-    )
-
+    return jsonify({
+        "status": "healthy",
+        "model_loaded": topk_model is not None,
+        "items_count": len(item_ids) if item_ids else 0
+    }), 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
+    # Sử dụng `threaded=True` là mặc định cho Flask
     app.run(host="0.0.0.0", port=port)
