@@ -4,7 +4,7 @@ from flask import Flask, request, jsonify
 import os
 import logging
 import requests
-import io  # Đọc CSV từ bytes
+import io
 
 # ========== Cấu hình logging ==========
 logging.basicConfig(
@@ -15,13 +15,12 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-
-# ====== Hàm load model an toàn ======
+# ====== Hàm load model an toàn với fallback URL ======
 def safe_load_pickle(url_or_path, name):
     logger.info(f"🔹 Bắt đầu load model '{name}' từ: {url_or_path}")
     try:
         if url_or_path.startswith("http"):
-            response = requests.get(url_or_path)
+            response = requests.get(url_or_path, timeout=10)
             response.raise_for_status()
             model = pickle.loads(response.content)
         else:
@@ -33,18 +32,17 @@ def safe_load_pickle(url_or_path, name):
         logger.error(f"❌ Lỗi khi load '{url_or_path}' cho {name}: {e}")
         return None
 
-
-# ====== Load model SVD ======
-model_url = "./svd_model_nf32_lr0.001_reg0.05_ep40_p1.0_balanced.pkl"
+# ====== Load model SVD (sử dụng URL fallback) ======
+# Thay bằng URL thực tế của bạn (ví dụ: Google Drive link)
+model_url = os.environ.get("MODEL_URL", "./svd_model_nf32_lr0.001_reg0.05_ep40_p1.0_balanced.pkl")
 topk_model = safe_load_pickle(model_url, "Top-K SVD model")
 
-
-# ====== Hàm load CSV an toàn ======
+# ====== Hàm load CSV an toàn với fallback URL ======
 def safe_load_csv(url_or_path):
     logger.info(f"🔹 Đang load file CSV: {url_or_path}")
     try:
         if url_or_path.startswith("http"):
-            response = requests.get(url_or_path)
+            response = requests.get(url_or_path, timeout=10)
             response.raise_for_status()
             df = pd.read_csv(io.BytesIO(response.content))
         else:
@@ -55,19 +53,16 @@ def safe_load_csv(url_or_path):
         logger.error(f"❌ Lỗi khi load CSV từ '{url_or_path}': {e}")
         return None
 
-
 # ====== Load danh sách item ======
 def load_items():
-    csv_url = "./Cell_Phones_and_Accessories.train.csv"
+    # Thay bằng URL thực tế của bạn
+    csv_url = os.environ.get("CSV_URL", "./Cell_Phones_and_Accessories.train.csv")
     items_df = safe_load_csv(csv_url)
     if items_df is None:
         logger.warning("⚠️ Không thể load danh sách item (CSV rỗng hoặc lỗi).")
         return []
     try:
-        # Xử lý parent_asin có thể chứa nhiều giá trị (chỉ lấy giá trị đầu)
-        items_df["parent_asin"] = (
-            items_df["parent_asin"].astype(str).str.split(",").str[0]
-        )
+        items_df["parent_asin"] = items_df["parent_asin"].astype(str).str.split(",").str[0]
         unique_items = items_df["parent_asin"].dropna().unique().tolist()
         logger.info(f"✅ Đã load {len(unique_items)} item duy nhất.")
         return unique_items
@@ -75,15 +70,11 @@ def load_items():
         logger.error(f"❌ Lỗi khi xử lý dữ liệu CSV: {e}")
         return []
 
-
 item_ids = load_items()
-
 
 # ====== Logic gợi ý top-K ======
 def get_top_k_recommendations(user_id, item_ids, model, k=10, blocked_items=None):
-    logger.info(
-        f"🔹 Tính toán gợi ý cho user={user_id}, top_k={k}, blocked={len(blocked_items or [])}"
-    )
+    logger.info(f"🔹 Tính toán gợi ý cho user={user_id}, top_k={k}, blocked={len(blocked_items or [])}")
 
     if model is None:
         return [{"error": "Model not loaded"}]
@@ -96,14 +87,11 @@ def get_top_k_recommendations(user_id, item_ids, model, k=10, blocked_items=None
         return [{"error": "No valid items after filtering blocked items"}]
 
     predictions = []
-    # Chỉ tính toán rating cho các item chưa tương tác (hoặc chưa bị chặn)
     for iid in valid_items:
         try:
-            # model.predict sẽ ước tính rating (est)
             pred = model.predict(uid=user_id, iid=iid).est
             predictions.append((iid, pred))
         except Exception as e:
-            # Bỏ qua item nếu có lỗi trong quá trình dự đoán (ít xảy ra với surprise)
             logger.warning(f"⚠️ Bỏ qua item {iid} cho user {user_id}: {e}")
             continue
 
@@ -111,23 +99,17 @@ def get_top_k_recommendations(user_id, item_ids, model, k=10, blocked_items=None
         logger.warning(f"⚠️ Không tạo được gợi ý nào cho user {user_id}.")
         return [{"error": "No predictions could be made"}]
 
-    # Sắp xếp và lấy top K
     predictions.sort(key=lambda x: x[1], reverse=True)
     top_predictions = predictions[: min(k, len(predictions))]
     logger.info(f"✅ Trả về {len(top_predictions)} gợi ý cho user {user_id}.")
-    return [
-        {"item_id": iid, "predicted_rating": round(r, 2)}
-        for iid, r in top_predictions
-    ]
-
+    return [{"item_id": iid, "predicted_rating": round(r, 2)} for iid, r in top_predictions]
 
 # ====== API /recommend (POST) ======
 @app.route("/recommend", methods=["POST"])
 def recommend():
     logger.info("📩 Nhận yêu cầu POST /recommend")
     try:
-        # force=True cho phép đọc data ngay cả khi Content-Type không phải application/json
-        data = request.get_json(force=True) 
+        data = request.get_json(force=True)
         logger.info(f"📦 Payload nhận được: {data}")
     except Exception:
         logger.error("❌ Payload không hợp lệ.")
@@ -135,8 +117,7 @@ def recommend():
 
     user_id = data.get("user_id")
     k = data.get("top_k", 10)
-    # Default blocked_items để test
-    blocked_items = data.get("blocked_items", ["B00K30H3O8"]) 
+    blocked_items = data.get("blocked_items", ["B00K30H3O8"])
 
     if not user_id:
         return jsonify({"error": "user_id is required"}), 400
@@ -155,47 +136,27 @@ def recommend():
     if not all(isinstance(iid, str) for iid in blocked_items):
         return jsonify({"error": "blocked_items must contain valid string IDs"}), 400
 
-    recommendations = get_top_k_recommendations(
-        user_id, item_ids, topk_model, k, blocked_items
-    )
+    recommendations = get_top_k_recommendations(user_id, item_ids, topk_model, k, blocked_items)
 
     if "error" in recommendations[0]:
         logger.warning(f"⚠️ Lỗi khi tạo gợi ý cho user {user_id}: {recommendations[0]}")
         return jsonify(recommendations[0]), 500
 
-    # Định dạng kết quả đầu ra
     results = [
-        {
-            "user_id": user_id,
-            "parent_asin": rec["item_id"],
-            "predicted_rating": rec["predicted_rating"],
-        }
+        {"user_id": user_id, "parent_asin": rec["item_id"], "predicted_rating": rec["predicted_rating"]}
         for rec in recommendations
     ]
 
     logger.info(f"✅ Hoàn tất trả kết quả cho user {user_id}.")
     return jsonify(results), 200
 
-
 # ====== API /health (GET) ======
 @app.route("/health", methods=["GET"])
 def health():
     logger.info("🔍 Kiểm tra tình trạng hệ thống (/health)")
-    return (
-        jsonify(
-            {
-                "status": "healthy",
-                "model_loaded": topk_model is not None,
-                "items_count": len(item_ids),
-            }
-        ),
-        200,
-    )
-
+    return jsonify({"status": "healthy", "model_loaded": topk_model is not None, "items_count": len(item_ids)}), 200
 
 if __name__ == "__main__":
-    # Dùng cổng từ biến môi trường PORT (Railway sẽ cung cấp) hoặc mặc định 8000
     port = int(os.environ.get("PORT", 8000))
     logger.info(f"🚀 Server đang chạy tại http://0.0.0.0:{port}")
-    # Khi chạy cục bộ, dùng app.run. Trong Docker, Gunicorn sẽ chạy app.
     app.run(host="0.0.0.0", port=port)
