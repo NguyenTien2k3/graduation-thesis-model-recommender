@@ -37,3 +37,4 @@ ENV PYTHONUNBUFFERED=1
 # SỬA LỖI: Chuyển sang "shell form" của CMD để biến $PORT được nhận diện.
 # Gunicorn cần biến $PORT do Railway cung cấp để hoạt động đúng.
 CMD gunicorn --bind 0.0.0.0:$PORT --workers 1 --preload --timeout 300 --worker-tmp-dir /dev/shm --max-requests 100 --max-requests-jitter 10 app:app
+
